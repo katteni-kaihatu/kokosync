@@ -1,0 +1,28 @@
+{
+  "name": "kokosync",
+  "version": "0.1.0",
+  "description": "ブラウザとネイティブアプリが同じセッションに参加し、任意のデータを共有するための同期基盤。 MessagePackを共通形式とし、WebRTC・LiteNetLib・QUICの違いをJS / TypeScript、C#、GoのSDKで吸収する。",
+  "directories": {
+    "doc": "docs",
+    "example": "examples"
+  },
+  "scripts": {
+    "smoke:js": "node sdk/js/smoke.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/katteni-kaihatu/kokosync.git"
+  },
+  "keywords": [],
+  "author": "",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/katteni-kaihatu/kokosync/issues"
+  },
+  "homepage": "https://github.com/katteni-kaihatu/kokosync#readme",
+  "dependencies": {
+    "@msgpack/msgpack": "3.1.3",
+    "@noble/hashes": "2.4.0"
+  },
+  "private": true
+}

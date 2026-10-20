@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kokosync — a shared little canvas</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="importmap">
+    {"imports":{"@msgpack/msgpack":"/vendor/@msgpack/msgpack/dist.esm/index.mjs","@noble/hashes/sha2.js":"/vendor/@noble/hashes/sha2.js"}}
+  </script>
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <main>
+    <header class="masthead">
+      <a class="wordmark" href="/">koko<span>sync</span><i aria-hidden="true"></i></a>
+      <span class="edition">THE SHARED CANVAS / LOCAL PROTOTYPE</span>
+    </header>
+    <section class="intro">
+      <div><p class="eyebrow">A little space, together.</p><h1>Make your mark.</h1>
+        <p>Open this room in a second window. Draw a trail.<br>Watch two places become one canvas.</p></div>
+      <div class="room-note"><span id="status-dot"></span><strong id="status">Ready to join</strong><small id="capabilities">Choose your connection below.</small></div>
+    </section>
+    <form id="join-form" class="connection">
+      <label>Room<input id="room" value="little-canvas" maxlength="64" required></label>
+      <label>Your name<input id="peer" maxlength="64" required></label>
+      <label>Connection<select id="transport"><option value="webrtc">WebRTC</option><option value="websocket">WebSocket · reliable fallback</option></select></label>
+      <button id="join" type="submit">Join canvas <span aria-hidden="true">↗</span></button>
+    </form>
+    <section class="workspace" aria-label="Shared canvas">
+      <div class="toolbar">
+        <div class="palette" role="group" aria-label="Ink color">
+          <button type="button" class="swatch selected" data-color="#2558b5" style="--ink:#2558b5" aria-label="Blue ink" aria-pressed="true"></button>
+          <button type="button" class="swatch" data-color="#df6150" style="--ink:#df6150" aria-label="Coral ink" aria-pressed="false"></button>
+          <button type="button" class="swatch" data-color="#2b806e" style="--ink:#2b806e" aria-label="Green ink" aria-pressed="false"></button>
+          <button type="button" class="swatch" data-color="#c08d27" style="--ink:#c08d27" aria-label="Gold ink" aria-pressed="false"></button>
+        </div>
+        <span class="canvas-hint">Click or drag to leave a trail</span>
+        <button id="clear" class="text-button" type="button" disabled>Clear canvas</button>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="canvas" width="1200" height="580" tabindex="0" aria-label="Shared drawing board. Press Enter to place a point in the center."></canvas>
+        <div id="empty" class="empty"><span aria-hidden="true">✳</span><p>Every point starts somewhere.</p><small>Join the room to add yours.</small></div>
+        <div class="canvas-label">SHARED SPACE <span>120 most recent marks</span></div>
+      </div>
+      <footer class="canvas-footer">
+        <span><i class="tiny-dot"></i><span id="marks">0 marks</span></span>
+        <span>Operation <b id="sequence">0</b></span>
+        <button id="checkpoint" class="text-button" type="button" disabled>Save checkpoint</button>
+      </footer>
+    </section>
+    <p id="notice" role="status" aria-live="polite">The canvas is kept in server memory. A restart starts fresh.</p>
+    <section class="underneath">
+      <div><p class="eyebrow">What travels between us</p><h2>Small messages.<br>Shared possibilities.</h2><p>Marks are ordered operations. Cursors are ephemeral updates. A checkpoint lets the next person pick up where you left off.</p><a id="second-window" target="_blank" rel="noopener" href="/">Open a second canvas ↗</a></div>
+      <div class="inspector"><div class="inspector-head"><span>LAST OPERATION</span><span id="traffic">—</span></div><pre id="operation">Join a room to see a message.</pre><p id="transport-detail">WebRTC is the default. WebSocket is an explicit fallback.</p></div>
+    </section>
+    <details class="file-panel"><summary>Try a verified file transfer</summary><p>Send up to 5 MiB to another name in this room. The receiving browser verifies SHA-256 before offering a download.</p><form id="file-form"><label>To<input id="recipient" placeholder="Name in the other window" required></label><label>File<input id="file" type="file" required></label><button id="send-file" type="submit" disabled>Send file</button></form><div id="downloads"></div></details>
+    <footer class="page-footer"><span>kokosync / experimental transport playground</span><span>Memory only · local development · no authentication</span></footer>
+  </main>
+</body>
+</html>

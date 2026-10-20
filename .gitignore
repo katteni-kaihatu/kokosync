@@ -1,0 +1,6 @@
+.tools/
+node_modules/
+bin/
+obj/
+*.log
+.run/
