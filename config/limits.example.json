@@ -1,0 +1,31 @@
+{
+  "fragmentation": {
+    "logicalBytes": 4194304,
+    "chunkBytes": 12288,
+    "reassemblyBytes": 8388608,
+    "inflightBytes": 65536,
+    "concurrent": 4,
+    "timeoutMs": 30000,
+    "queueBytes": 8388608
+  },
+  "stateBytes": 2097152,
+  "checkpointBytes": 2097152,
+  "historyBytes": 4194304,
+  "dedupBytes": 4194304,
+  "storageBytes": 67108864,
+  "transferBytes": 67108864,
+  "peerDelivery": {
+    "version": 1,
+    "messageBytes": 4194304,
+    "chunkBytes": 12288,
+    "windowBytes": 65536,
+    "queueBytes": 8388608,
+    "receiveBytes": 8388608,
+    "concurrent": 4,
+    "queued": 128,
+    "lanes": 64,
+    "timeoutMs": 30000,
+    "assemblyMs": 30000,
+    "retries": 5
+  }
+}

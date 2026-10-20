@@ -3,11 +3,17 @@ module github.com/katteni-kaihatu/kokosync
 go 1.27.3
 
 require (
-	github.com/coder/websocket v1.8.15 // indirect
+	github.com/coder/websocket v1.8.15
+	github.com/pion/ice/v4 v4.4.7
+	github.com/pion/webrtc/v4 v4.2.24
+	github.com/quic-go/quic-go v0.64.1
+	github.com/vmihailenco/msgpack/v5 v5.4.1
+)
+
+require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/datachannel v1.6.3 // indirect
 	github.com/pion/dtls/v3 v3.1.13 // indirect
-	github.com/pion/ice/v4 v4.4.7 // indirect
 	github.com/pion/interceptor v0.1.49 // indirect
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/mdns/v2 v2.2.2 // indirect
@@ -20,9 +26,6 @@ require (
 	github.com/pion/stun/v4 v4.0.1 // indirect
 	github.com/pion/transport/v5 v5.1.1 // indirect
 	github.com/pion/turn/v5 v5.1.2 // indirect
-	github.com/pion/webrtc/v4 v4.2.24 // indirect
-	github.com/quic-go/quic-go v0.64.1 // indirect
-	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.54.0 // indirect

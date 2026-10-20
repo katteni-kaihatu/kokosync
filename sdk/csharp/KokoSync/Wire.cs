@@ -8,19 +8,19 @@ public static class Wire
 {
     public const int MaxFrame = 65536;
     public const int MaxRealtimeFrame = 1000;
-    public static byte[] Encode(IReadOnlyDictionary<string, object?> value)
+    public static byte[] Encode(IReadOnlyDictionary<string, object?> value, int maxBytes = MaxFrame)
     {
         var buffer = new ArrayBufferWriter<byte>();
         var writer = new MessagePackWriter(buffer);
         Write(ref writer, value, 0);
         writer.Flush();
-        if (buffer.WrittenCount > MaxFrame) throw new ArgumentException("Frame exceeds 65536 bytes.");
+        if (buffer.WrittenCount > maxBytes) throw new ArgumentException($"Frame exceeds {maxBytes} bytes.");
         return buffer.WrittenSpan.ToArray();
     }
 
-    public static Dictionary<string, object?> Decode(ReadOnlyMemory<byte> bytes)
+    public static Dictionary<string, object?> Decode(ReadOnlyMemory<byte> bytes, int maxBytes = MaxFrame)
     {
-        if (bytes.Length > MaxFrame) throw new ArgumentException("Frame exceeds 65536 bytes.");
+        if (bytes.Length > maxBytes) throw new ArgumentException($"Frame exceeds {maxBytes} bytes.");
         var reader = new MessagePackReader(bytes);
         var result = Read(ref reader, 0) as Dictionary<string, object?>
             ?? throw new FormatException("Frame must be a string-key map.");
@@ -28,14 +28,34 @@ public static class Wire
         return result;
     }
 
-    public static void ValidateValue(object? value)
+    public static void ValidateValue(object? value, int maxBytes = 16384)
     {
         Validate(value, 0);
         var buffer = new ArrayBufferWriter<byte>();
         var writer = new MessagePackWriter(buffer);
         Write(ref writer, value, 0);
         writer.Flush();
-        if (buffer.WrittenCount > 16384) throw new ArgumentException("Application value exceeds 16 KiB.");
+        if (buffer.WrittenCount > maxBytes) throw new ArgumentException($"Application value exceeds {maxBytes} bytes.");
+    }
+    internal static byte[] EncodeValue(object? value, int maxBytes)
+    {
+        Validate(value, 0);
+        var buffer = new ArrayBufferWriter<byte>();
+        var writer = new MessagePackWriter(buffer);
+        Write(ref writer, value, 0);
+        writer.Flush();
+        if (buffer.WrittenCount > maxBytes) throw new ValueTooLargeException(maxBytes);
+        return buffer.WrittenSpan.ToArray();
+    }
+    internal sealed class ValueTooLargeException(int maxBytes)
+        : ArgumentException($"Application value exceeds {maxBytes} bytes.");
+    internal static object? DecodeValue(ReadOnlyMemory<byte> bytes)
+    {
+        var reader = new MessagePackReader(bytes);
+        var value = Read(ref reader, 0);
+        if (!reader.End) throw new FormatException("Trailing MessagePack data.");
+        Validate(value, 0);
+        return value;
     }
 
     private static void Validate(object? value, int depth)
@@ -106,13 +126,13 @@ public static class Wire
                     ? reader.ReadUInt64() : (object)reader.ReadInt64();
             case MessagePackType.Array:
                 var count = reader.ReadArrayHeader();
-                if (count > MaxFrame) throw new FormatException("Invalid array length.");
+                if (count > reader.Sequence.Length - reader.Consumed) throw new FormatException("Invalid array length.");
                 var array = new object?[count];
                 for (var i = 0; i < count; i++) array[i] = Read(ref reader, depth + 1);
                 return array;
             case MessagePackType.Map:
                 var length = reader.ReadMapHeader();
-                if (length > MaxFrame) throw new FormatException("Invalid map length.");
+                if (length > (reader.Sequence.Length - reader.Consumed) / 2) throw new FormatException("Invalid map length.");
                 var map = new Dictionary<string, object?>(StringComparer.Ordinal);
                 for (var i = 0; i < length; i++)
                 {

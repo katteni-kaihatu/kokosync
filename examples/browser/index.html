@@ -14,7 +14,7 @@
   <main>
     <header class="masthead">
       <a class="wordmark" href="/">koko<span>sync</span><i aria-hidden="true"></i></a>
-      <span class="edition">THE SHARED CANVAS / LOCAL PROTOTYPE</span>
+      <span class="edition">THE SHARED CANVAS / SESSION PROTOTYPE</span>
     </header>
     <section class="intro">
       <div><p class="eyebrow">A little space, together.</p><h1>Make your mark.</h1>
@@ -54,8 +54,29 @@
       <div><p class="eyebrow">What travels between us</p><h2>Small messages.<br>Shared possibilities.</h2><p>Marks are ordered operations. Cursors are ephemeral updates. A checkpoint lets the next person pick up where you left off.</p><a id="second-window" target="_blank" rel="noopener" href="/">Open a second canvas ↗</a></div>
       <div class="inspector"><div class="inspector-head"><span>LAST OPERATION</span><span id="traffic">—</span></div><pre id="operation">Join a room to see a message.</pre><p id="transport-detail">WebRTC is the default. WebSocket is an explicit fallback.</p></div>
     </section>
+    <section class="route-panel" aria-labelledby="route-heading">
+      <div class="route-heading"><div><p class="eyebrow">How updates reach each person</p><h2 id="route-heading">Peer routes</h2></div><label class="route-toggle"><input id="relay-only" type="checkbox">Use relay only</label></div>
+      <p>Cursors and live updates can travel directly between compatible browsers. Marks and checkpoints always use the server. Up to two direct peers are selected automatically.</p>
+      <div class="route-table-wrap"><table><thead><tr><th>Peer</th><th>Route / reason</th><th>Direct RTT</th><th>Direct sent / received</th><th>Relay sent / received</th></tr></thead><tbody id="routes"><tr><td colspan="5">Join a room to see peer routes.</td></tr></tbody></table></div>
+      <div class="route-probe"><button id="send-probe" type="button" disabled>Send latest + live probe</button><div><p id="latest-probe">Latest: no probe received.</p><p id="live-probe">Live: no probe received.</p></div></div>
+    </section>
+    <section class="route-panel" aria-labelledby="delivery-heading">
+      <div class="route-heading"><div><p class="eyebrow">Addressed delivery, acknowledged by the receiver SDK</p><h2 id="delivery-heading">Reliable peer messages</h2></div></div>
+      <p>Send a small operation or an atomic large value to selected peers. A receipt confirms SDK acceptance; application changes and saving need their own acknowledgement. Different topics can make progress independently.</p>
+      <form id="peer-delivery-form" class="peer-delivery-form">
+        <label>To<select id="delivery-to"><option value="*">All other peers</option></select></label>
+        <label>Payload<select id="delivery-size"><option value="0">Small operation</option><option value="1048576">1 MiB snapshot</option><option value="2097152">2 MiB snapshot</option></select></label>
+        <label>Topic<input id="delivery-topic" value="demo.peer.operation" maxlength="128" required></label>
+        <button id="send-peer" type="submit" disabled>Send peer message</button>
+        <button id="cancel-peer" type="button" disabled>Cancel pending send</button>
+      </form>
+      <p id="delivery-result" role="status" aria-live="polite">Join a room to try addressed delivery.</p>
+      <div class="inspector"><div class="inspector-head"><span>RECEIVED PEER MESSAGES</span><span id="delivery-count">0 RECEIVED</span></div><pre id="peer-messages">No peer messages received.</pre></div>
+      <details class="delivery-stats"><summary>Delivery statistics</summary><pre id="peer-statistics">No measurements yet.</pre></details>
+    </section>
     <details class="file-panel"><summary>Try a verified file transfer</summary><p>Send up to 5 MiB to another name in this room. The receiving browser verifies SHA-256 before offering a download.</p><form id="file-form"><label>To<input id="recipient" placeholder="Name in the other window" required></label><label>File<input id="file" type="file" required></label><button id="send-file" type="submit" disabled>Send file</button></form><div id="downloads"></div></details>
-    <footer class="page-footer"><span>kokosync / experimental transport playground</span><span>Memory only · local development · no authentication</span></footer>
+    <details class="file-panel"><summary>Send a large message</summary><p>Send ordinary application data to everyone in this room. Each browser checks its byte count and SHA-256. Draw or move your cursor while it arrives.</p><form id="large-form"><label>Message size<select id="large-size"><option value="262144">256 KiB</option><option value="1048576" selected>1 MiB</option><option value="2097152">2 MiB</option></select></label><button id="send-large" type="submit" disabled>Send large message</button></form><p id="large-result" role="status" aria-live="polite">Join a room to try a large message.</p></details>
+    <footer class="page-footer"><span>kokosync / experimental transport playground</span><span>Memory only · shared prototype</span></footer>
   </main>
 </body>
 </html>

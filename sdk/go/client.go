@@ -25,28 +25,58 @@ type Options struct {
 	// InsecureDevelopment permits the relay's ephemeral certificate on a literal loopback IP only.
 	InsecureDevelopment bool
 	TLSConfig           *tls.Config
+	Fragmentation       protocol.Limits
+	PeerDelivery        *protocol.PeerLimits
+	DisablePeerDelivery bool
 }
 type Error struct{ Code, Message string }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
 
 type Client struct {
-	conn      *quic.Conn
-	stream    *quic.Stream
-	writeMu   sync.Mutex
-	mu        sync.Mutex
-	pending   map[string]chan Message
-	transfers map[string]chan Message
-	state     map[string]Message
-	latest    map[string]uint64
-	messages  chan Message
-	done      chan struct{}
-	once      sync.Once
-	info      Message
+	link                       *protocol.Link
+	conn                       *quic.Conn
+	stream                     *quic.Stream
+	writeMu                    sync.Mutex
+	mu                         sync.Mutex
+	pending                    map[string]chan Message
+	transfers                  map[string]chan Message
+	state                      map[string]Message
+	latest                     map[string]uint64
+	messages                   chan Message
+	done                       chan struct{}
+	once                       sync.Once
+	info                       Message
+	appQueue                   []queuedMessage
+	appBytes, appLimit         int
+	appBulkBytes, appBulkCount int
+	appWake                    chan struct{}
+	routes                     map[string]RouteInfo
+	routingKnown               bool
+	delivery                   *peerDelivery
+}
+type queuedMessage struct {
+	message Message
+	bytes   int
+	bulk    bool
 }
 
 func id() string { var b [12]byte; _, _ = rand.Read(b[:]); return hex.EncodeToString(b[:]) }
 func Connect(ctx context.Context, o Options) (*Client, error) {
+	limits, err := o.Fragmentation.Normalize()
+	if err != nil {
+		return nil, err
+	}
+	deliveryLimits := protocol.DefaultPeerLimits()
+	if !o.DisablePeerDelivery {
+		if o.PeerDelivery != nil {
+			deliveryLimits = *o.PeerDelivery
+		}
+		if err := deliveryLimits.Validate(); err != nil {
+			return nil, &DeliveryError{"InvalidArgument", "not-sent", err.Error()}
+		}
+	}
+
 	if o.Address == "" {
 		o.Address = "127.0.0.1:8081"
 	}
@@ -76,10 +106,26 @@ func Connect(ctx context.Context, o Options) (*Client, error) {
 		_ = conn.CloseWithError(0, "failed")
 		return nil, e
 	}
-	c := &Client{conn: conn, stream: stream, pending: map[string]chan Message{}, transfers: map[string]chan Message{}, state: map[string]Message{}, latest: map[string]uint64{}, messages: make(chan Message, 256), done: make(chan struct{})}
+	c := &Client{conn: conn, stream: stream, pending: map[string]chan Message{}, transfers: map[string]chan Message{}, state: map[string]Message{}, latest: map[string]uint64{}, messages: make(chan Message), done: make(chan struct{}), appWake: make(chan struct{}, 1), appLimit: limits.QueueBytes}
+	c.link = protocol.NewLink(limits, true, func(b []byte) error {
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+		_ = c.stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		return protocol.WriteFrame(c.stream, b)
+	}, func(m Message) { c.acceptMessage(m) }, func(error) { c.Close() })
+	go c.link.Run()
+	if !o.DisablePeerDelivery {
+		c.appLimit = max(c.appLimit, deliveryLimits.QueueBytes)
+		c.delivery = newPeerDelivery(deliveryLimits, func(m Message) error { return c.link.Queue(m) }, func(m Message) bool { return c.tryEnqueueMessage(m, false) })
+	}
+	go c.dispatch()
 	go c.read()
 	go c.datagrams()
-	info, e := c.Request(ctx, Message{"type": "join", "room": o.Room, "peer": o.Peer, "state": o.State})
+	join := Message{"type": "join", "room": o.Room, "peer": o.Peer, "state": o.State, "fragmentation": limits.Map(), "routing": Message{"directProtocol": "none", "maxDirectPeers": 0}}
+	if c.delivery != nil {
+		join["peerDelivery"] = c.delivery.limits.Map()
+	}
+	info, e := c.Request(ctx, join)
 	if e != nil {
 		c.Close()
 		return nil, e
@@ -93,7 +139,19 @@ func (c *Client) Info() Message            { c.mu.Lock(); defer c.mu.Unlock(); r
 func (c *Client) Messages() <-chan Message { return c.messages }
 func (c *Client) Done() <-chan struct{}    { return c.done }
 func (c *Client) Close() {
-	c.once.Do(func() { close(c.done); _ = c.conn.CloseWithError(0, "client closed") })
+	c.once.Do(func() {
+		close(c.done)
+		if c.delivery != nil {
+			c.delivery.close()
+		}
+		c.mu.Lock()
+		c.routes = map[string]RouteInfo{}
+		c.mu.Unlock()
+		if c.link != nil {
+			c.link.Close()
+		}
+		_ = c.conn.CloseWithError(0, "client closed")
+	})
 }
 func (c *Client) read() {
 	defer c.Close()
@@ -124,10 +182,60 @@ func (c *Client) accept(b []byte) bool {
 		c.Close()
 		return false
 	}
+	if e := c.link.Accept(m); e != nil {
+		c.Close()
+		return false
+	}
+	return true
+}
+func (c *Client) acceptMessage(m Message) bool {
 	kind := protocol.String(m, "type")
+	if c.delivery != nil {
+		if protocol.IsPeerDelivery(kind) {
+			c.delivery.accept(m)
+			return true
+		}
+		if kind == "joined" || kind == "peer_joined" || kind == "peer_left" {
+			c.delivery.metadata(m)
+		}
+	}
+	if kind == "joined" {
+		if caps, ok := m["capabilities"].(map[string]any); ok {
+			if fm, ok := caps["fragmentation"].(map[string]any); ok {
+				limits, _ := c.link.Limits()
+				selected, e := protocol.NegotiateLimits(limits, fm)
+				if e != nil {
+					c.Close()
+					return false
+				}
+				c.link.Configure(selected, true)
+				c.mu.Lock()
+				c.appLimit = max(c.appLimit, selected.QueueBytes)
+				c.mu.Unlock()
+			} else {
+				limits, _ := c.link.Limits()
+				c.link.Configure(limits, false)
+			}
+		}
+	}
 	c.mu.Lock()
+	routingEvent := c.trackRoutingLocked(m)
 	if kind == "latest" || kind == "live" {
-		key := protocol.String(m, "peer") + "\x00" + protocol.String(m, "publisherEpoch") + "\x00" + kind + "\x00" + protocol.String(m, "key") + protocol.String(m, "stream")
+		if c.info == nil || !c.validRealtimeLocked(m) {
+			c.mu.Unlock()
+			return true
+		}
+		c.receivedRelayLocked(m)
+		defer func() {
+			if c.delivery != nil {
+				c.delivery.realtime(m, false)
+			}
+		}()
+		subject := protocol.String(m, "key")
+		if kind == "live" {
+			subject = protocol.String(m, "stream")
+		}
+		key := protocol.String(m, "peer") + "\x00" + protocol.String(m, "publisherEpoch") + "\x00" + kind + "\x00" + subject
 		n := protocol.Counter(m, "seq")
 		old, exists := c.latest[key]
 		if exists && n <= old {
@@ -169,6 +277,9 @@ func (c *Client) accept(b []byte) bool {
 		delete(c.pending, protocol.String(m, "id"))
 	}
 	c.mu.Unlock()
+	if routingEvent != nil && !c.enqueueMessage(routingEvent) {
+		return false
+	}
 	if isReply && pending != nil {
 		pending <- m
 		return true
@@ -182,17 +293,85 @@ func (c *Client) accept(b []byte) bool {
 			return false
 		}
 	}
-	select {
-	case c.messages <- m:
-		return true
-	case <-c.done:
-		return false
-	default:
+	return c.enqueueMessage(m)
+}
+func (c *Client) enqueueMessage(m Message) bool {
+	return c.tryEnqueueMessage(m, true)
+}
+func (c *Client) tryEnqueueMessage(m Message, closeOnOverflow bool) bool {
+	kind := protocol.String(m, "type")
+	c.mu.Lock()
+	appLimit := c.appLimit
+	c.mu.Unlock()
+	encoded, _ := protocol.EncodeLimit(m, appLimit)
+	c.mu.Lock()
+	bulk := kind == "peer_message" && len(encoded) > 16384
+	full := len(encoded) == 0 || len(c.appQueue) >= 256 || c.appBytes+len(encoded) > c.appLimit || bulk && (c.appBulkCount >= 255 || c.appBulkBytes+len(encoded) > c.appLimit-16384)
+	if !full {
+		c.appQueue = append(c.appQueue, queuedMessage{m, len(encoded), bulk})
+		c.appBytes += len(encoded)
+		if bulk {
+			c.appBulkBytes += len(encoded)
+			c.appBulkCount++
+		}
+	}
+	c.mu.Unlock()
+	if full {
 		if kind == "latest" || kind == "live" {
 			return true
 		}
-		c.Close()
+		if closeOnOverflow {
+			c.Close()
+		}
 		return false
+	}
+	select {
+	case c.appWake <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+func (c *Client) dispatch() {
+	defer func() {
+		c.mu.Lock()
+		c.appQueue = nil
+		c.appBytes = 0
+		c.appBulkBytes = 0
+		c.appBulkCount = 0
+		c.mu.Unlock()
+	}()
+	for {
+		c.mu.Lock()
+		var next queuedMessage
+		if len(c.appQueue) > 0 {
+			next = c.appQueue[0]
+		}
+		c.mu.Unlock()
+		if next.message == nil {
+			select {
+			case <-c.done:
+				return
+			case <-c.appWake:
+			}
+			continue
+		}
+		select {
+		case <-c.done:
+			return
+		case <-c.appWake:
+			continue
+		case c.messages <- next.message:
+			c.mu.Lock()
+			c.appQueue[0] = queuedMessage{}
+			c.appQueue = c.appQueue[1:]
+			c.appBytes -= next.bytes
+			if next.bulk {
+				c.appBulkBytes -= next.bytes
+				c.appBulkCount--
+			}
+			c.mu.Unlock()
+		}
 	}
 }
 
@@ -204,10 +383,6 @@ func (c *Client) Send(ctx context.Context, m Message) error {
 			return e
 		}
 	}
-	b, e := protocol.Encode(m)
-	if e != nil {
-		return e
-	}
 	select {
 	case <-c.done:
 		return errors.New("TransportClosed")
@@ -217,19 +392,23 @@ func (c *Client) Send(ctx context.Context, m Message) error {
 	}
 	kind := protocol.String(m, "type")
 	if kind == "latest" || kind == "live" {
+		b, e := protocol.Encode(m)
+		if e != nil {
+			return e
+		}
 		if len(b) > protocol.MaxRealtimeFrame-128 {
 			return errors.New("PayloadTooLarge: realtime relay metadata reserve")
 		}
-		return c.conn.SendDatagram(b)
+		e = c.conn.SendDatagram(b)
+		if e == nil {
+			c.sentRelay(m)
+			if c.delivery != nil {
+				c.delivery.realtime(m, true)
+			}
+		}
+		return e
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	deadline := time.Now().Add(10 * time.Second)
-	if d, ok := ctx.Deadline(); ok {
-		deadline = d
-	}
-	_ = c.stream.SetWriteDeadline(deadline)
-	return protocol.WriteFrame(c.stream, b)
+	return c.link.Queue(m)
 }
 func (c *Client) Request(ctx context.Context, m Message) (Message, error) {
 	if protocol.String(m, "id") == "" {
@@ -261,7 +440,8 @@ func (c *Client) Request(ctx context.Context, m Message) (Message, error) {
 	case <-c.done:
 		return nil, errors.New("TransportClosed: request outcome unknown")
 	case <-ctx.Done():
-		return nil, fmt.Errorf("request %s outcome unknown: %w", requestID, ctx.Err())
+		c.Close()
+		return nil, fmt.Errorf("request %s outcome unknown; session closed: %w", requestID, ctx.Err())
 	}
 }
 func (c *Client) Publish(ctx context.Context, topic string, value any) (Message, error) {

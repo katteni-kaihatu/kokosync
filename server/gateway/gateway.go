@@ -23,6 +23,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/katteni-kaihatu/kokosync/protocol"
 	"github.com/katteni-kaihatu/kokosync/server/core"
+	"github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
 	"github.com/quic-go/quic-go"
 )
@@ -32,10 +33,62 @@ type Server struct {
 	Root, BridgeSecret string
 	mu                 sync.Mutex
 	pcs                map[*webrtc.PeerConnection]struct{}
+	hosted             *hostedWeb
+}
+
+type hostedWeb struct {
+	publicIP       string
+	udpMin, udpMax uint16
 }
 
 func New(root, secret string) *Server {
 	return &Server{Core: core.New(), Root: root, BridgeSecret: secret, pcs: map[*webrtc.PeerConnection]struct{}{}}
+}
+
+// ConfigureHostedWeb must be called before serving. Only WebRTC is exposed by
+// this option; HTTP and native QUIC still require literal loopback addresses.
+// The reverse proxy is responsible for TLS and access authentication.
+func (s *Server) ConfigureHostedWeb(publicIP string, udpMin, udpMax int) error {
+	ip := net.ParseIP(publicIP)
+	if ip == nil || ip.To4() == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() {
+		return errors.New("public-ip must be a public IPv4 address")
+	}
+	if udpMin < 1024 || udpMax > 65535 || udpMax < udpMin {
+		return errors.New("RTC UDP range must satisfy 1024 <= min <= max <= 65535")
+	}
+	s.hosted = &hostedWeb{publicIP: ip.String(), udpMin: uint16(udpMin), udpMax: uint16(udpMax)}
+	return nil
+}
+func (s *Server) Mode() string {
+	if s.hosted != nil {
+		return "hosted-web"
+	}
+	return "local-development"
+}
+func (s *Server) rtcSettings() (webrtc.SettingEngine, error) {
+	settings := webrtc.SettingEngine{}
+	if s.hosted == nil {
+		settings.SetIncludeLoopbackCandidate(true)
+		settings.SetIPFilter(func(ip net.IP) bool { return ip.IsLoopback() })
+		settings.SetRemoteIPFilter(func(ip net.IP) bool { return ip.IsLoopback() })
+		return settings, nil
+	}
+	settings.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+	settings.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+	settings.SetIPFilter(func(ip net.IP) bool { return ip.To4() != nil && ip.IsGlobalUnicast() && !ip.IsLoopback() })
+	settings.SetRemoteIPFilter(func(ip net.IP) bool { return ip.To4() != nil && ip.IsGlobalUnicast() && !ip.IsLoopback() })
+	if err := settings.SetEphemeralUDPPortRange(s.hosted.udpMin, s.hosted.udpMax); err != nil {
+		return settings, err
+	}
+	// Pion 4.2.24's supported replacement for SetNAT1To1IPs: advertise the
+	// public IPv4 address on host candidates while preserving the bound port.
+	err := settings.SetICEAddressRewriteRules(webrtc.ICEAddressRewriteRule{
+		External:        []string{s.hosted.publicIP},
+		AsCandidateType: webrtc.ICECandidateTypeHost,
+		Mode:            webrtc.ICEAddressRewriteReplace,
+		Networks:        []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
+	})
+	return settings, err
 }
 func loopback(addr string) bool {
 	host, _, e := net.SplitHostPort(addr)
@@ -45,7 +98,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"mode":"local-development","durability":"memory"}`))
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mode": s.Mode(), "durability": "memory", "nativeTransports": "loopback-only"})
 	})
 	mux.HandleFunc("/ws", s.ws)
 	mux.HandleFunc("/bridge", s.ws)
@@ -58,8 +111,13 @@ func (s *Server) Handler() http.Handler {
 			http.Error(w, "local development only", 403)
 			return
 		}
-		// Avoid cross-origin websites connecting to an unauthenticated local service.
-		if origin := r.Header.Get("Origin"); origin != "" && origin != "http://"+r.Host && origin != "https://"+r.Host {
+		// Forwarded protocol is trusted only in explicitly configured hosted
+		// mode and after checking that the immediate peer is loopback.
+		scheme := "http"
+		if r.TLS != nil || (s.hosted != nil && r.Header.Get("X-Forwarded-Proto") == "https") {
+			scheme = "https"
+		}
+		if origin := r.Header.Get("Origin"); origin != "" && origin != scheme+"://"+r.Host {
 			http.Error(w, "same-origin required", 403)
 			return
 		}
@@ -71,6 +129,12 @@ func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
 	transport := "websocket"
 	datagram := false
 	if r.URL.Path == "/bridge" {
+		// The public proxy must deny this route. This also rejects accidental
+		// forwarding by a proxy configured with the required protocol header.
+		if s.hosted != nil && r.Header.Get("X-Forwarded-Proto") != "" {
+			http.Error(w, "bridge is local only", http.StatusForbidden)
+			return
+		}
 		if s.BridgeSecret == "" || r.Header.Get("X-Kokosync-Bridge") != s.BridgeSecret {
 			http.Error(w, "invalid bridge secret", 403)
 			return
@@ -112,10 +176,11 @@ func (s *Server) offer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid SDP", 400)
 		return
 	}
-	settings := webrtc.SettingEngine{}
-	settings.SetIncludeLoopbackCandidate(true)
-	settings.SetIPFilter(func(ip net.IP) bool { return ip.IsLoopback() })
-	settings.SetRemoteIPFilter(func(ip net.IP) bool { return ip.IsLoopback() })
+	settings, e := s.rtcSettings()
+	if e != nil {
+		http.Error(w, e.Error(), http.StatusInternalServerError)
+		return
+	}
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(settings))
 	pc, e := api.NewPeerConnection(webrtc.Configuration{})
 	if e != nil {

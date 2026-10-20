@@ -13,51 +13,126 @@ public sealed class ProtocolException(string code, string message) : Exception($
 /// <summary>Prototype session. Consume Events promptly; slow consumers disconnect.</summary>
 public sealed class Client : IAsyncDisposable
 {
+    private sealed record QueuedEvent(Dictionary<string, object?> Frame, int Bytes, bool Bulk);
     private readonly ITransport transport;
     private readonly CancellationTokenSource stop = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<Dictionary<string, object?>>> requests = new();
     private readonly ConcurrentDictionary<string, Channel<Dictionary<string, object?>>> blobs = new();
     private readonly ConcurrentDictionary<string, bool> receivingBlobs = new();
-    private readonly Channel<Dictionary<string, object?>> events = Channel.CreateBounded<Dictionary<string, object?>>(16);
+    private readonly Channel<QueuedEvent> events = Channel.CreateBounded<QueuedEvent>(16);
+    private long queuedEventBytes;
+    private long queuedBulkEventBytes;
+    private int queuedBulkEvents;
     private readonly Task receive;
+    private readonly Fragmentation fragments;
+    private readonly FragmentationOptions? fragmentation;
+    private Exception? failure;
     private readonly Dictionary<string, ulong> realtimeSequences = new();
+    private readonly RelayRoutes relayRoutes = new();
+    private readonly PeerDelivery peerDelivery;
+    private readonly PeerDeliveryOptions peerDeliveryOptions;
     public Dictionary<string, object?>? Joined { get; private set; }
-    private Client(ITransport transport) { this.transport = transport; receive = ReceiveAsync(); }
+    public FragmentationOptions? SelectedFragmentation => fragments.Selected;
+    /// <summary>Current peers' latest/live routes. This SDK has no direct adapter and reports relay routes.</summary>
+    public IReadOnlyList<RouteInfo> Routes => relayRoutes.Snapshot();
+    public IReadOnlyList<DeliveryStat> DeliveryStats => peerDelivery.Snapshot();
+    internal Client(ITransport transport, FragmentationOptions? options, PeerDeliveryOptions? deliveryOptions = null)
+    {
+        this.transport = transport;
+        options ??= new FragmentationOptions();
+        peerDeliveryOptions = deliveryOptions ?? new PeerDeliveryOptions();
+        peerDeliveryOptions.Validate();
+        fragmentation = options.Enabled ? options : null;
+        fragments = new Fragmentation(transport, fragmentation, error =>
+        {
+            failure ??= error;
+            stop.Cancel();
+        });
+        peerDelivery = new PeerDelivery(transport, peerDeliveryOptions, (frame, bulk) =>
+        {
+            try { return QueueEvent(frame, peerDeliveryOptions.QueueBytes, bulk); }
+            catch (ArgumentException) { return false; }
+        });
+        receive = ReceiveAsync();
+    }
 
     public static async Task<Client> ConnectLiteNetLibAsync(string host = "127.0.0.1", int port = 8082,
-        bool insecureDevelopment = false, CancellationToken ct = default)
+        bool insecureDevelopment = false, CancellationToken ct = default, FragmentationOptions? fragmentation = null,
+        PeerDeliveryOptions? peerDelivery = null)
     {
         var transport = new LiteTransport(host, port, insecureDevelopment);
-        try { await transport.WaitConnectedAsync(ct); return new Client(transport); }
+        try { await transport.WaitConnectedAsync(ct); return new Client(transport, fragmentation, peerDelivery); }
         catch { await transport.DisposeAsync(); throw; }
     }
 
-    public static async Task<Client> ConnectWebSocketAsync(Uri endpoint, CancellationToken ct = default)
+    public static async Task<Client> ConnectWebSocketAsync(Uri endpoint, CancellationToken ct = default,
+        FragmentationOptions? fragmentation = null, PeerDeliveryOptions? peerDelivery = null)
     {
         var socket = new ClientWebSocket();
-        try { await socket.ConnectAsync(endpoint, ct); return new Client(new SocketTransport(socket)); }
+        try { await socket.ConnectAsync(endpoint, ct); return new Client(new SocketTransport(socket), fragmentation, peerDelivery); }
         catch { socket.Dispose(); throw; }
     }
 
-    public IAsyncEnumerable<Dictionary<string, object?>> Events(CancellationToken ct = default) => events.Reader.ReadAllAsync(ct);
+    public async IAsyncEnumerable<Dictionary<string, object?>> Events(
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await foreach (var queued in events.Reader.ReadAllAsync(ct))
+        {
+            ReleaseEvent(queued);
+            yield return queued.Frame;
+        }
+    }
+    private void ReleaseEvent(QueuedEvent queued)
+    {
+        Interlocked.Add(ref queuedEventBytes, -queued.Bytes);
+        if (queued.Bulk)
+        {
+            Interlocked.Add(ref queuedBulkEventBytes, -queued.Bytes);
+            Interlocked.Decrement(ref queuedBulkEvents);
+        }
+    }
+    private bool QueueEvent(Dictionary<string, object?> frame, int? byteLimit = null, bool bulk = false)
+    {
+        var limit = byteLimit ?? fragments.Selected?.QueueBytes ?? fragmentation?.QueueBytes ?? 16 * Wire.MaxFrame;
+        var bytes = Wire.Encode(frame, byteLimit ?? Math.Max(Wire.MaxFrame, fragments.LogicalBytes)).Length;
+        var queued = new QueuedEvent(frame, bytes, bulk);
+        var totalBytes = Interlocked.Add(ref queuedEventBytes, bytes);
+        var bulkBytes = bulk ? Interlocked.Add(ref queuedBulkEventBytes, bytes) : 0;
+        var bulkCount = bulk ? Interlocked.Increment(ref queuedBulkEvents) : 0;
+        if (totalBytes > limit || bulk && (bulkBytes > limit - 16384L || bulkCount > 15))
+        {
+            ReleaseEvent(queued);
+            return false;
+        }
+        if (events.Writer.TryWrite(queued)) return true;
+        ReleaseEvent(queued);
+        return false;
+    }
 
     public async Task<Dictionary<string, object?>> JoinAsync(string room, string peer, bool state = false, CancellationToken ct = default)
     {
-        Joined = await RequestAsync(Frame("join", ("room", room), ("peer", peer), ("state", state)), ct);
+        var frame = Frame("join", ("room", room), ("peer", peer), ("state", state));
+        frame["routing"] = new Dictionary<string, object?> { ["directProtocol"] = "none", ["maxDirectPeers"] = 0 };
+        if (fragmentation != null) frame["fragmentation"] = fragmentation.ToWire();
+        if (peerDeliveryOptions.Enabled) frame["peerDelivery"] = peerDeliveryOptions.ToWire();
+        Joined = await RequestAsync(frame, ct);
         return Joined;
     }
     public Task<Dictionary<string, object?>> MessageAsync(string topic, object? value, CancellationToken ct = default)
         => ValueRequest("message", topic, value, ct);
+    /// <summary>Delivers one addressed Value. A receipt confirms receiver SDK admission, not application execution.</summary>
+    public Task<DeliveryReceipt> SendToAsync(string peer, string topic, object? value, CancellationToken ct = default)
+        => peerDelivery.SendToAsync(peer, topic, value, ct);
     public Task<Dictionary<string, object?>> EventAsync(string topic, object? value, uint? ttlMs = null, CancellationToken ct = default)
     {
-        Wire.ValidateValue(value);
+        Wire.ValidateValue(value, fragments.ValueBytes);
         var frame = Frame("event", ("topic", topic), ("value", value));
         if (ttlMs.HasValue) frame["ttlMs"] = ttlMs.Value;
         return RequestAsync(frame, ct);
     }
     public Task<Dictionary<string, object?>> SetAsync(string key, object? value, ulong? expected = null, CancellationToken ct = default)
     {
-        Wire.ValidateValue(value);
+        Wire.ValidateValue(value, fragments.ValueBytes);
         var frame = Frame("set", ("key", key), ("value", value));
         if (expected.HasValue) frame["expected"] = expected.Value;
         return RequestAsync(frame, ct);
@@ -72,12 +147,12 @@ public sealed class Client : IAsyncDisposable
     public Task<Dictionary<string, object?>> CatchupAsync(CancellationToken ct = default) => RequestAsync(Frame("catchup"), ct);
     public Task<Dictionary<string, object?>> CheckpointAsync(ulong seq, object? value, CancellationToken ct = default)
     {
-        Wire.ValidateValue(value);
+        Wire.ValidateValue(value, fragments.ValueBytes);
         return RequestAsync(Frame("checkpoint", ("seq", seq), ("value", value)), ct);
     }
     public ValueTask LatestAsync(string key, object? value, ulong seq, CancellationToken ct = default)
     {
-        Wire.ValidateValue(value);
+        Wire.ValidateValue(value, fragments.ValueBytes);
         return SendAsync(Frame("latest", ("key", key), ("value", value), ("seq", seq)), ct);
     }
     public ValueTask LiveAsync(string stream, byte[] value, ulong seq, uint ttlMs, string? codec = null, CancellationToken ct = default)
@@ -88,18 +163,26 @@ public sealed class Client : IAsyncDisposable
     }
     private Task<Dictionary<string, object?>> ValueRequest(string type, string topic, object? value, CancellationToken ct)
     {
-        Wire.ValidateValue(value);
+        Wire.ValidateValue(value, fragments.ValueBytes);
         return RequestAsync(Frame(type, ("topic", topic), ("value", value)), ct);
     }
 
     /// <summary>Advanced operations. Values and frame size are checked; callers own protocol semantics.</summary>
     public ValueTask SendAsync(IReadOnlyDictionary<string, object?> frame, CancellationToken ct = default)
     {
-        if (frame.TryGetValue("value", out var value)) Wire.ValidateValue(value);
-        var bytes = Wire.Encode(frame);
         var realtime = frame.TryGetValue("type", out var type) && type is "latest" or "live";
+        if (frame.TryGetValue("value", out var value)) Wire.ValidateValue(value, realtime ? 16384 : fragments.ValueBytes);
+        var blob = type is string operation && operation.StartsWith("blob_", StringComparison.Ordinal);
+        var bytes = Wire.Encode(frame, realtime || blob || PeerDelivery.IsFrame(type as string) || type is "join" ? Wire.MaxFrame : fragments.LogicalBytes);
         if (realtime && bytes.Length > Wire.MaxRealtimeFrame - 128) throw new ArgumentException("Realtime frame exceeds 872 bytes (128 bytes reserved for relay metadata).");
-        return transport.SendAsync(bytes, realtime, ct);
+        return realtime ? SendRealtimeAsync(frame, bytes, ct) : fragments.SendAsync(frame, bytes, ct);
+    }
+    private async ValueTask SendRealtimeAsync(IReadOnlyDictionary<string, object?> frame, byte[] bytes, CancellationToken ct)
+    {
+        var recipients = relayRoutes.Recipients(frame);
+        await transport.SendAsync(bytes, true, ct);
+        relayRoutes.Sent(recipients);
+        peerDelivery.RealtimeSent(recipients, (string)frame["type"]!, bytes.Length);
     }
 
     public async Task<Dictionary<string, object?>> RequestAsync(Dictionary<string, object?> frame, CancellationToken ct = default)
@@ -108,7 +191,11 @@ public sealed class Client : IAsyncDisposable
         frame["id"] = id;
         var waiter = new TaskCompletionSource<Dictionary<string, object?>>(TaskCreationOptions.RunContinuationsAsynchronously);
         if (!requests.TryAdd(id, waiter)) throw new ArgumentException("Request id already in flight.");
-        try { await SendAsync(frame, ct); return await waiter.Task.WaitAsync(TimeSpan.FromSeconds(15), ct); }
+        try
+        {
+            await SendAsync(frame, ct);
+            return await waiter.Task.WaitAsync(TimeSpan.FromMilliseconds(Math.Max(15000, fragmentation?.TimeoutMs ?? 15000)), ct);
+        }
         finally { requests.TryRemove(id, out _); }
     }
 
@@ -218,25 +305,65 @@ public sealed class Client : IAsyncDisposable
         {
             await foreach (var bytes in transport.ReadAllAsync(stop.Token))
             {
-                var frame = Wire.Decode(bytes);
+                var frame = await fragments.ReceiveAsync(Wire.Decode(bytes));
+                if (frame == null) continue;
                 var type = frame["type"] as string;
+                if (await peerDelivery.ReceiveAsync(frame, bytes.Length))
+                {
+                    await fragments.CompleteReceiveAsync();
+                    continue;
+                }
+                if (type == "joined")
+                {
+                    fragments.Negotiate(frame);
+                    relayRoutes.Join(frame);
+                    peerDelivery.Join(frame);
+                    realtimeSequences.Clear();
+                    Joined = frame;
+                }
+                if (type is "peer_joined" or "peer_left")
+                {
+                    if (relayRoutes.Update(frame) is { } change)
+                    {
+                        peerDelivery.MemberChanged(frame, change.Removed);
+                        if (change.Removed)
+                        {
+                            var latestPrefix = $"latest\0{change.Route.Peer}\0{change.Route.PublisherEpoch}\0";
+                            var livePrefix = $"live\0{change.Route.Peer}\0{change.Route.PublisherEpoch}\0";
+                            foreach (var retiredStream in realtimeSequences.Keys.Where(candidate =>
+                                candidate.StartsWith(latestPrefix, StringComparison.Ordinal) || candidate.StartsWith(livePrefix, StringComparison.Ordinal)).ToArray())
+                                realtimeSequences.Remove(retiredStream);
+                        }
+                        var routeEvent = change.Route.Event(change.Removed);
+                        if (!change.Removed && frame.GetValueOrDefault("peerDelivery") is Dictionary<string, object?> deliveryCapability)
+                            routeEvent["peerDelivery"] = new Dictionary<string, object?>(deliveryCapability);
+                        if (!QueueEvent(routeEvent)) throw new IOException("Event consumer queue overflow.");
+                    }
+                    await fragments.CompleteReceiveAsync();
+                    continue;
+                }
                 // Register before exposing the offer: an empty transfer can end before
                 // application code begins accepting it, and cancellation can arrive early.
                 if (type == "blob_open" && frame.GetValueOrDefault("transfer") is string offeredTransfer)
                 {
                     if (blobs.Count >= 4 || !blobs.TryAdd(offeredTransfer, Channel.CreateBounded<Dictionary<string, object?>>(16)))
                         throw new IOException("Too many or duplicate blob offers.");
-                    if (!events.Writer.TryWrite(frame)) throw new IOException("Event consumer queue overflow.");
+                    if (!QueueEvent(frame)) throw new IOException("Event consumer queue overflow.");
+                    await fragments.CompleteReceiveAsync();
                     continue;
                 }
                 if (type == "blob_cancel" && frame.GetValueOrDefault("transfer") is string cancelledTransfer &&
                     blobs.TryRemove(cancelledTransfer, out var cancelledChannel))
                 {
                     cancelledChannel.Writer.TryComplete(new IOException("Remote cancelled blob."));
+                    await fragments.CompleteReceiveAsync();
                     continue;
                 }
                 if (type is "latest" or "live")
                 {
+                    if (Joined == null) continue;
+                    if (!relayRoutes.Received(frame)) continue;
+                    peerDelivery.RealtimeReceived(frame, bytes.Length);
                     var streamKey = $"{type}\0{frame.GetValueOrDefault("peer")}\0{frame.GetValueOrDefault("publisherEpoch")}\0{frame.GetValueOrDefault(type == "latest" ? "key" : "stream")}";
                     var sequence = Number(frame, "seq");
                     if (realtimeSequences.TryGetValue(streamKey, out var previous) && sequence <= previous) continue;
@@ -250,6 +377,7 @@ public sealed class Client : IAsyncDisposable
                 {
                     if (type == "error") waiter.TrySetException(new ProtocolException((string)frame["code"]!, (string)frame["message"]!));
                     else waiter.TrySetResult(frame);
+                    await fragments.CompleteReceiveAsync();
                     continue;
                 }
                 if (frame.TryGetValue("transfer", out var transfer) && transfer is string key &&
@@ -257,16 +385,22 @@ public sealed class Client : IAsyncDisposable
                 {
                     if (!channel.Writer.TryWrite(frame)) throw new IOException("Blob consumer queue overflow.");
                 }
-                else if (!events.Writer.TryWrite(frame)) throw new IOException("Event consumer queue overflow.");
+                else if (!QueueEvent(frame)) throw new IOException("Event consumer queue overflow.");
+                await fragments.CompleteReceiveAsync();
             }
         }
-        catch (Exception ex) { error = ex; }
+        catch (Exception ex) { error = failure ?? ex; }
         finally
         {
+            relayRoutes.Clear();
+            peerDelivery.Close();
+            realtimeSequences.Clear();
             events.Writer.TryComplete(error);
+            while (events.Reader.TryRead(out var queued)) ReleaseEvent(queued);
             foreach (var waiter in requests.Values) waiter.TrySetException(error);
             foreach (var channel in blobs.Values) channel.Writer.TryComplete(error);
             stop.Cancel();
+            fragments.Fail(error);
             await transport.DisposeAsync();
         }
     }
@@ -282,6 +416,8 @@ public sealed class Client : IAsyncDisposable
         stop.Cancel();
         await transport.DisposeAsync();
         await receive;
+        await peerDelivery.DisposeAsync();
+        await fragments.DisposeAsync();
         stop.Dispose();
     }
 }

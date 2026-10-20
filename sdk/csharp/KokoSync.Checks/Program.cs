@@ -31,12 +31,36 @@ try
 }
 catch (ArgumentException) { }
 Console.WriteLine("CHECKS_OK codec uint64 safe-values localhost-opt-in");
+await FragmentationChecks.RunAsync();
+await RoutingChecks.RunAsync();
+await PeerDeliveryChecks.RunAsync();
+if (args.Contains("--peer-delivery"))
+{
+    var endpoint = args.FirstOrDefault(arg => arg.StartsWith("--ws="))?[5..] ?? "ws://127.0.0.1:8080/ws";
+    var udpArgument = args.FirstOrDefault(arg => arg.StartsWith("--udp-port="))?[11..];
+    await PeerDeliveryIntegration.RunAsync(new Uri(endpoint), udpArgument == null ? null : int.Parse(udpArgument));
+}
+if (args.Contains("--routing"))
+{
+    var endpoint = args.FirstOrDefault(arg => arg.StartsWith("--ws="))?[5..] ?? "ws://127.0.0.1:8080/ws";
+    var udpArgument = args.FirstOrDefault(arg => arg.StartsWith("--udp-port="))?[11..];
+    await RoutingChecks.RunIntegrationAsync(new Uri(endpoint), udpArgument == null ? null : int.Parse(udpArgument));
+}
+if (args.Contains("--fragmentation"))
+{
+    var endpoint = args.FirstOrDefault(arg => arg.StartsWith("--ws="))?[5..] ?? "ws://127.0.0.1:8080/ws";
+    var udpArgument = args.FirstOrDefault(arg => arg.StartsWith("--udp-port="))?[11..];
+    await FragmentationIntegration.RunAsync(new Uri(endpoint), udpArgument == null ? null : int.Parse(udpArgument));
+}
 if (!args.Contains("--integration")) return;
 
 using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(35));
 var ct = deadline.Token;
-await using var udp = await Client.ConnectLiteNetLibAsync(insecureDevelopment: true, ct: ct);
-await using var ws = await Client.ConnectWebSocketAsync(new Uri("ws://127.0.0.1:8080/ws"), ct);
+await using var udp = await Client.ConnectLiteNetLibAsync(
+    port: int.Parse(args.FirstOrDefault(arg => arg.StartsWith("--udp-port="))?[11..] ?? "8082"),
+    insecureDevelopment: true, ct: ct);
+await using var ws = await Client.ConnectWebSocketAsync(
+    new Uri(args.FirstOrDefault(arg => arg.StartsWith("--ws="))?[5..] ?? "ws://127.0.0.1:8080/ws"), ct);
 var room = "csharp-check-" + Guid.NewGuid().ToString("N")[..8];
 var message = new TaskCompletionSource<Dictionary<string, object?>>(TaskCreationOptions.RunContinuationsAsynchronously);
 var latest = new TaskCompletionSource<Dictionary<string, object?>>(TaskCreationOptions.RunContinuationsAsynchronously);

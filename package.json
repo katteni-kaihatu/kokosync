@@ -7,7 +7,11 @@
     "example": "examples"
   },
   "scripts": {
-    "smoke:js": "node sdk/js/smoke.js"
+    "smoke:js": "node sdk/js/smoke.js",
+    "test:fragmentation": "node --test sdk/js/fragmentation.test.js",
+    "test:routing": "node --test sdk/js/routing.test.js",
+    "test:peer-delivery": "node --test sdk/js/peer-delivery.test.js",
+    "smoke:peer-delivery": "node sdk/js/peer-delivery-smoke.js"
   },
   "repository": {
     "type": "git",

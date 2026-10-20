@@ -20,8 +20,11 @@ const MaxRealtimeFrame = 1000
 type Message = map[string]any
 
 func Encode(m Message) ([]byte, error) {
+	return EncodeLimit(m, MaxFrame)
+}
+func EncodeLimit(m Message, limit int) ([]byte, error) {
 	b, err := msgpack.Marshal(m)
-	if len(b) > MaxFrame {
+	if len(b) > limit {
 		return nil, errors.New("PayloadTooLarge")
 	}
 	return b, err
@@ -30,7 +33,10 @@ func Encode(m Message) ([]byte, error) {
 // Decode validates lengths, nesting, map keys and extension absence before decoding.
 // This prevents tiny hostile frames claiming multi-gigabyte arrays from allocating.
 func Decode(b []byte) (Message, error) {
-	if len(b) == 0 || len(b) > MaxFrame {
+	return DecodeLimit(b, MaxFrame)
+}
+func DecodeLimit(b []byte, limit int) (Message, error) {
+	if len(b) == 0 || len(b) > limit {
 		return nil, errors.New("invalid frame size")
 	}
 	p := parser{b: b}
