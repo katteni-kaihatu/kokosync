@@ -98,7 +98,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mode": s.Mode(), "durability": "memory", "nativeTransports": "loopback-only"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mode": s.Mode(), "durability": "memory", "nativeTransports": "loopback-only", "rooms": s.Core.RoomStats()})
 	})
 	mux.HandleFunc("/ws", s.ws)
 	mux.HandleFunc("/bridge", s.ws)

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -59,6 +60,17 @@ func TestHostedBoundaryAndProxyOrigin(t *testing.T) {
 			}
 			if tt.want == 200 && !strings.Contains(res.Body.String(), `"mode":"hosted-web"`) {
 				t.Fatal("health did not report hosted mode")
+			}
+			if tt.want == 200 {
+				var health struct {
+					Rooms struct {
+						Max           int `json:"max"`
+						IdleTimeoutMs int `json:"idleTimeoutMs"`
+					} `json:"rooms"`
+				}
+				if err := json.Unmarshal(res.Body.Bytes(), &health); err != nil || health.Rooms.Max != 1024 || health.Rooms.IdleTimeoutMs != 600000 {
+					t.Fatalf("health missing room limits: %s (%v)", res.Body.String(), err)
+				}
 			}
 		})
 	}

@@ -1,4 +1,6 @@
 {
+  "maxRooms": 1024,
+  "roomIdleTimeoutMs": 600000,
   "fragmentation": {
     "logicalBytes": 4194304,
     "chunkBytes": 12288,

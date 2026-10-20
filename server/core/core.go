@@ -50,6 +50,7 @@ type transfer struct {
 	ended                bool
 }
 type room struct {
+	idleSince                                             time.Time
 	historyBytes, stateBytes, dedupBytes, checkpointBytes int
 	name, epoch                                           string
 	peers                                                 map[string]*Peer
@@ -72,22 +73,32 @@ type Core struct {
 }
 
 type Config struct {
-	Fragmentation   protocol.Limits     `json:"fragmentation"`
-	StateBytes      int                 `json:"stateBytes"`
-	HistoryBytes    int                 `json:"historyBytes"`
-	DedupBytes      int                 `json:"dedupBytes"`
-	CheckpointBytes int                 `json:"checkpointBytes"`
-	StorageBytes    int                 `json:"storageBytes"`
-	TransferBytes   int                 `json:"transferBytes"`
-	PeerDelivery    protocol.PeerLimits `json:"peerDelivery"`
+	MaxRooms          int                 `json:"maxRooms"`
+	RoomIdleTimeoutMs int                 `json:"roomIdleTimeoutMs"`
+	Fragmentation     protocol.Limits     `json:"fragmentation"`
+	StateBytes        int                 `json:"stateBytes"`
+	HistoryBytes      int                 `json:"historyBytes"`
+	DedupBytes        int                 `json:"dedupBytes"`
+	CheckpointBytes   int                 `json:"checkpointBytes"`
+	StorageBytes      int                 `json:"storageBytes"`
+	TransferBytes     int                 `json:"transferBytes"`
+	PeerDelivery      protocol.PeerLimits `json:"peerDelivery"`
 }
 
 func DefaultConfig() Config {
-	return Config{protocol.DefaultLimits(), 2 << 20, 4 << 20, 4 << 20, 2 << 20, 64 << 20, 64 << 20, protocol.DefaultPeerLimits()}
+	return Config{
+		MaxRooms: 1024, RoomIdleTimeoutMs: 600000,
+		Fragmentation: protocol.DefaultLimits(), PeerDelivery: protocol.DefaultPeerLimits(),
+		StateBytes: 2 << 20, HistoryBytes: 4 << 20, DedupBytes: 4 << 20, CheckpointBytes: 2 << 20,
+		StorageBytes: 64 << 20, TransferBytes: 64 << 20,
+	}
 }
 func New() *Core { c, _ := NewWithConfig(DefaultConfig()); return c }
 func NewWithConfig(cfg Config) (*Core, error) {
 	var e error
+	if cfg.MaxRooms < 1 || cfg.MaxRooms > 1<<20 || cfg.RoomIdleTimeoutMs < 1 || uint64(cfg.RoomIdleTimeoutMs) > uint64((1<<63-1)/time.Millisecond) {
+		return nil, fmt.Errorf("invalid room count or idle timeout")
+	}
 	cfg.Fragmentation, e = cfg.Fragmentation.Normalize()
 	if e != nil {
 		return nil, e
@@ -152,6 +163,9 @@ func (c *Core) Disconnect(p *Peer) {
 	}
 	if r.peers[p.id] == p {
 		delete(r.peers, p.id)
+		if len(r.peers) == 0 {
+			r.idleSince = time.Now()
+		}
 		for _, other := range r.peers {
 			c.deliver(other, M{"type": "peer_left", "epoch": r.epoch, "peer": p.id, "publisherEpoch": p.publisherEpoch}, false, 0)
 		}
@@ -660,13 +674,15 @@ func (c *Core) join(p *Peer, m M) {
 		}
 		p.link.Configure(selected, true)
 	}
+	now := time.Now()
+	c.pruneIdleRoomsLocked(now)
 	r := c.rooms[name]
 	if r == nil {
-		if len(c.rooms) >= 64 {
+		if len(c.rooms) >= c.Config.MaxRooms {
 			c.fail(p, id, "Backpressure", "room limit")
 			return
 		}
-		r = &room{name: name, epoch: token(), peers: map[string]*Peer{}, entries: map[string]M{}, dedup: map[string]record{}, latest: map[string]uint64{}, transfers: map[string]*transfer{}}
+		r = &room{idleSince: now, name: name, epoch: token(), peers: map[string]*Peer{}, entries: map[string]M{}, dedup: map[string]record{}, latest: map[string]uint64{}, transfers: map[string]*transfer{}}
 		c.rooms[name] = r
 	}
 	if len(r.peers) >= 32 || r.peers[peerID] != nil {
@@ -721,6 +737,7 @@ func (c *Core) join(p *Peer, m M) {
 	}
 	p.id = peerID
 	p.room = r
+	r.idleSince = time.Time{}
 	p.state = state
 	p.peerDelivery = peerDelivery
 	p.directProtocol = directProtocol

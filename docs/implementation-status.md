@@ -56,6 +56,8 @@
 
 ## 接続方式ごとの制約を確認する
 
+部屋数の上限は既定1,024部屋（`maxRooms`）。最後のpeerの退出から既定10分（`roomIdleTimeoutMs`）たった空部屋は、状態・履歴・重複排除・チェックポイントとともに削除し、保存容量を回収する。期限前の再参加では同じepochを保ち、期限後の再作成ではepochが変わる。接続中のpeerがある部屋は保持する。サーバー実装を組み込む場合は、プロセスのcontextで`Core.RunRoomCleanup(ctx)`を起動する。標準の`cmd/kokosync`は起動済みで、join時にも期限を確認する。
+
 | 経路 | 状態・操作・ファイル | 位置・ライブ |
 | --- | --- | --- |
 | ブラウザ↔Go | WebRTC ordered DataChannel | unordered / 再送なしの別DataChannel |

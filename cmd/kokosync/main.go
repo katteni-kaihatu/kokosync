@@ -26,7 +26,7 @@ func main() {
 	publicIP := flag.String("public-ip", "", "enable hosted browser WebRTC with this public IPv4 address; requires authenticated TLS proxy")
 	rtcUDPMin := flag.Int("rtc-udp-min", 40000, "hosted WebRTC UDP port range minimum")
 	rtcUDPMax := flag.Int("rtc-udp-max", 40100, "hosted WebRTC UDP port range maximum")
-	limitsPath := flag.String("limits", os.Getenv("KOKOSYNC_LIMITS"), "optional JSON file overriding fragmentation and room/server byte budgets")
+	limitsPath := flag.String("limits", os.Getenv("KOKOSYNC_LIMITS"), "optional JSON file overriding room count, idle timeout, fragmentation and byte budgets")
 	flag.Parse()
 	if e := gateway.ValidateHTTPAddr(*httpAddr); e != nil {
 		log.Fatal(e)
@@ -57,6 +57,7 @@ func main() {
 			log.Fatal(e)
 		}
 	}
+	go s.Core.RunRoomCleanup(ctx)
 	httpServer := &http.Server{Addr: *httpAddr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if e := s.ServeQUIC(ctx, *quicAddr); e != nil && ctx.Err() == nil {
